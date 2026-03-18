@@ -1371,7 +1371,7 @@ class GiteeAIImagePlugin(Star):
         )
         origin = getattr(event, "unified_msg_origin", "") or ""
         if message_id and origin:
-            if self.debouncer.llm_tool_is_duplicate(message_id, origin):
+           if self.debouncer is not None and self.debouncer.llm_tool_is_duplicate(message_id, origin):
                 logger.debug(f"[aiimg_generate] 重复调用已拦截: msg_id={message_id}")
                 await mark_success(event)
                 return None
