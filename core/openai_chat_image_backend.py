@@ -934,6 +934,7 @@ class OpenAIChatImageBackend:
                 model=final_model,
                 messages=[{"role": "user", "content": parts}],
                 extra_body=eb or None,
+                stream=False,
             )
         except Exception as e:
             if _is_client_closed_error(e):
@@ -943,6 +944,7 @@ class OpenAIChatImageBackend:
                     model=final_model,
                     messages=[{"role": "user", "content": parts}],
                     extra_body=eb or None,
+                    stream=False,
                 )
             else:
                 logger.error(
