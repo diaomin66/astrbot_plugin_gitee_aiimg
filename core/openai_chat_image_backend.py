@@ -598,7 +598,6 @@ class OpenAIChatImageBackend:
         except Exception as e:
             logger.debug("[extract_refs] model_dump 处理异常: %s", e)
 
-        # 调试日志 - 非常重要，帮你看到实际内容
         logger.info("[DEBUG] 提取到的图片引用数量: %d", len(refs))
         if refs:
             logger.info("[DEBUG] 提取到的 refs: %s", refs)
@@ -616,7 +615,6 @@ class OpenAIChatImageBackend:
         return refs[0] if refs else None
 
     async def _extract_video_ref_from_response(self, resp: object) -> str | None:
-        # 省略不变，保持原样
         try:
             choices_raw = await _resolve_awaitable(getattr(resp, "choices", []))
             choices = list(choices_raw) if choices_raw is not None else []
@@ -716,58 +714,81 @@ class OpenAIChatImageBackend:
 
         size_hint = f" Output size target: {size or '1024x1024'}."
 
-        # 加强 prompt 约束，尽量避免分块返回
         user_text = (
             f"{prompt}\n\n"
-            "You MUST return **ONLY** one line in exactly this format, nothing else, no explanation, no code block, no prefix:\n"
+            "Immediately return ONLY this exact line, nothing before or after, no explanation, no code block:\n"
             "![Generated Image](https://your-direct-image-url-here)\n"
-            "Use a direct https image URL. Do NOT use base64 unless impossible. Do NOT split the line.\n"
+            "Use direct https image URL. Do NOT use base64. Do NOT split the line.\n"
             f"{size_hint}"
         )
 
         eb = {**self.extra_body, **(extra_body or {})}
         t0 = time.time()
 
+        full_content = ""
         try:
-            resp = await client.chat.completions.create(
+            stream = await client.chat.completions.create(
                 model=final_model,
                 messages=[{"role": "user", "content": user_text}],
                 extra_body=eb or None,
-                stream=False,  # 强制非 streaming
+                stream=True,
             )
+
+            logger.info("[generate] 开始收集 streaming chunks...")
+
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    full_content += delta.content
+                    logger.debug("[generate chunk content]: %s", delta.content.strip())
+
+            logger.info("[generate] 完整拼接 content 长度: %d", len(full_content))
+            logger.info("[generate] 完整 content 前1000字符: %s", full_content[:1000] or "空")
+
         except Exception as e:
             if _is_client_closed_error(e):
-                logger.warning("[OpenAIChatImage][generate] client 已关闭，重建后重试一次")
+                logger.warning("[generate] client 已关闭，重建后重试")
                 client = await self._recreate_client(key)
-                resp = await client.chat.completions.create(
+                stream = await client.chat.completions.create(
                     model=final_model,
                     messages=[{"role": "user", "content": user_text}],
                     extra_body=eb or None,
-                    stream=False,  # 重试也强制非 streaming
+                    stream=True,
                 )
+                full_content = ""
+                async for chunk in stream:
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        full_content += chunk.choices[0].delta.content
             else:
-                logger.error(
-                    "[OpenAIChatImage][generate] API 调用失败，base_url=%s，耗时: %.2fs: %s",
-                    self.base_url, time.time() - t0, e
-                )
+                logger.error("[generate] API 调用失败: %s", e)
                 raise
 
-        refs = await self._extract_image_refs_from_response(resp)
-        ref = refs[0] if refs else None
+        # 优先使用原提取函数
+        ref = _extract_first_image_ref(full_content)
 
-        debug_snippet = ""
-        try:
-            debug_snippet = str(getattr(resp.choices[0].message, "content", "")).strip().replace("\n", " ")[:300]
-        except Exception:
-            pass
+        # 如果没提取到，fallback 用正则直接找图片 URL
+        if not ref:
+            url_match = re.search(
+                r'(https?://[^\s"\'()<>]+?\.(?:png|jpe?g|webp|gif|bmp)[^\s"\'()<>]*)',
+                full_content, re.IGNORECASE
+            )
+            if url_match:
+                ref = url_match.group(0).strip()
+                logger.info("[generate] fallback 正则提取到图片 URL: %s", ref)
 
-        logger.info("[OpenAIChatImage][generate] API 响应耗时: %.2fs", time.time() - t0)
+        refs = [ref] if ref else []
+        debug_snippet = full_content[:300].replace("\n", " ") if full_content else "无内容"
+
+        logger.info("[generate] API 总耗时: %.2fs", time.time() - t0)
 
         if not ref:
-            video_url = await self._extract_video_ref_from_response(resp)
-            if video_url:
-                raise RuntimeError(f"chat 返回了视频而不是图片：{video_url}")
-            raise RuntimeError(f"未能从响应中提取图片链接。debug_snippet: {debug_snippet}")
+            raise RuntimeError(
+                f"收集完整 streaming content 后仍未提取到图片链接。\n"
+                f"完整 content 前500: {full_content[:500]}\n"
+                f"debug_snippet: {debug_snippet}"
+            )
 
         return await self._save_from_ref(
             ref, debug_snippet=debug_snippet, fallback_refs=refs[1:]
@@ -798,7 +819,7 @@ class OpenAIChatImageBackend:
 
         text = (
             f"{prompt}\n\n"
-            "Edit the attached image(s). Return **ONLY** one line in exactly this format, nothing else:\n"
+            "Edit the attached image(s). Return ONLY this exact line, nothing else:\n"
             "![Edited Image](https://your-direct-image-url-here)\n"
             "Use direct https URL. Do NOT split. No explanation.\n"
             f"{size_hint}"
@@ -817,46 +838,65 @@ class OpenAIChatImageBackend:
         eb = {**self.extra_body, **(extra_body or {})}
         t0 = time.time()
 
+        full_content = ""
         try:
-            resp = await client.chat.completions.create(
+            stream = await client.chat.completions.create(
                 model=final_model,
                 messages=[{"role": "user", "content": parts}],
                 extra_body=eb or None,
-                stream=False,  # 强制非 streaming
+                stream=True,
             )
+
+            logger.info("[edit] 开始收集 streaming chunks...")
+
+            async for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    full_content += chunk.choices[0].delta.content
+                    logger.debug("[edit chunk content]: %s", chunk.choices[0].delta.content.strip())
+
+            logger.info("[edit] 完整拼接 content 长度: %d", len(full_content))
+            logger.info("[edit] 完整 content 前1000字符: %s", full_content[:1000] or "空")
+
         except Exception as e:
             if _is_client_closed_error(e):
-                logger.warning("[OpenAIChatImage][edit] client 已关闭，重建后重试一次")
+                logger.warning("[edit] client 已关闭，重建后重试")
                 client = await self._recreate_client(key)
-                resp = await client.chat.completions.create(
+                stream = await client.chat.completions.create(
                     model=final_model,
                     messages=[{"role": "user", "content": parts}],
                     extra_body=eb or None,
-                    stream=False,
+                    stream=True,
                 )
+                full_content = ""
+                async for chunk in stream:
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        full_content += chunk.choices[0].delta.content
             else:
-                logger.error(
-                    "[OpenAIChatImage][edit] API 调用失败，base_url=%s，耗时: %.2fs: %s",
-                    self.base_url, time.time() - t0, e
-                )
+                logger.error("[edit] API 调用失败: %s", e)
                 raise
 
-        refs = await self._extract_image_refs_from_response(resp)
-        ref = refs[0] if refs else None
-
-        debug_snippet = ""
-        try:
-            debug_snippet = str(getattr(resp.choices[0].message, "content", "")).strip().replace("\n", " ")[:300]
-        except Exception:
-            pass
-
-        logger.info("[OpenAIChatImage][edit] API 响应耗时: %.2fs", time.time() - t0)
+        ref = _extract_first_image_ref(full_content)
 
         if not ref:
-            video_url = await self._extract_video_ref_from_response(resp)
-            if video_url:
-                raise RuntimeError(f"chat 返回了视频而不是图片：{video_url}")
-            raise RuntimeError(f"未能从响应中提取图片链接。debug_snippet: {debug_snippet}")
+            url_match = re.search(
+                r'(https?://[^\s"\'()<>]+?\.(?:png|jpe?g|webp|gif|bmp)[^\s"\'()<>]*)',
+                full_content, re.IGNORECASE
+            )
+            if url_match:
+                ref = url_match.group(0).strip()
+                logger.info("[edit] fallback 正则提取到图片 URL: %s", ref)
+
+        refs = [ref] if ref else []
+        debug_snippet = full_content[:300].replace("\n", " ") if full_content else "无内容"
+
+        logger.info("[edit] API 总耗时: %.2fs", time.time() - t0)
+
+        if not ref:
+            raise RuntimeError(
+                f"收集完整 streaming content 后仍未提取到图片链接。\n"
+                f"完整 content 前500: {full_content[:500]}\n"
+                f"debug_snippet: {debug_snippet}"
+            )
 
         return await self._save_from_ref(
             ref, debug_snippet=debug_snippet, fallback_refs=refs[1:]
